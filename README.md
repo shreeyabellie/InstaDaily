@@ -15,3 +15,4 @@ InstaDaily is a smart scheduling interface designed to make regular grocery orde
 ### Project Objective
 
 The aim of InstaDaily is to simplify recurring grocery shopping by allowing users to plan and schedule their regular orders in advance.
+<img width="3508" height="13192" alt="image" src="https://github.com/user-attachments/assets/20a649a0-c771-4ff7-b01e-59d656fa82ae" />
