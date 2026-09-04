@@ -1,0 +1,90 @@
+import base64
+import requests
+import json
+
+# GitHub repository details
+GITHUB_TOKEN = 'your_personal_access_token_here'
+REPO_OWNER = 'your_github_username'
+REPO_NAME = 'your_repository_name'
+FILE_PATH = 'InstaDaily-User-Guide.pdf'
+COMMIT_MESSAGE = 'Add InstaDaily guide content'
+
+# Content from the provided source
+file_content = """InstaDaily Guide[cite: 1]
+InstaDaily How to Use[cite: 1]
+A quick-commerce app where a cart can be shared across devices, and the app works out who owes what.[cite: 1]
+
+Step 1 Log in with your phone number[cite: 1]
+Download InstaDaily and open it.[cite: 1] Tap Login, enter your 10-digit number, and verify the OTP.[cite: 1]
+First-time users set a display name here.[cite: 1] This one matters more than it does on other apps, because your name is what everyone in a shared cart sees next to every item you add and every rupee you owe.[cite: 1] Use a real first name, not a handle.[cite: 1]
+
+Step 2 Set your delivery address[cite: 1]
+Allow location access or search your area, then drop the pin on your building and add flat number, floor and a landmark.[cite: 1] Save it as Home.[cite: 1]
+One thing to remember for later: a shared cart delivers to one address, not several.[cite: 1] The person who starts the cart sets it.[cite: 1]
+
+Step 3 Choose solo or shared cart[cite: 1]
+On the home screen you get two options: Shop Alone or Start a Shared Cart.[cite: 1]
+Solo works like any quick-commerce app.[cite: 1] Tap Shared Cart when you're ordering with flatmates, family or friends.[cite: 1] Name the cart something obvious "Flat 402 groceries", "Sunday snacks" since you may have more than one running.[cite: 1]
+
+Step 4 Invite people to the cart[cite: 1]
+Once the cart exists, tap Invite.[cite: 1] Share the link on WhatsApp or add people from your contacts.[cite: 1] They open it, log in on their own phone, and they're in.[cite: 1]
+Everyone sees the same cart update live.[cite: 1] If your flatmate adds milk from her room, it appears on your screen in a couple of seconds.[cite: 1] Nobody has to pass a phone around.[cite: 1]
+
+Step 5 Add items[cite: 1]
+Search or browse, tap ADD, adjust quantity.[cite: 1] Every item carries a small tag showing who added it, so the cart reads like a list with names attached.[cite: 1]
+For anything the group is sharing a 5kg rice bag, a bottle of oil mark it as Shared.[cite: 1] The cost then gets divided instead of billed to whoever tapped ADD.[cite: 1]
+
+Step 6 Check the split[cite: 1]
+Open the Split tab in the cart.[cite: 1] Instead of one total, you see a per-person breakdown: your items, your share of anything marked Shared, and your slice of the delivery and handling fees.[cite: 1]
+Three people, 840 total, and the screen tells you it's 310/295/235 rather than leaving someone to work it out later.[cite: 1] Anyone can reassign an item if it's tagged to the wrong person, up until checkout.[cite: 1]
+
+Step 7 Lock the cart and pay[cite: 1]
+Whoever starts checkout locks the cart, so nobody adds a packet of chips mid-payment.[cite: 1]
+Two ways to pay:[cite: 1]
+• One person pays the full amount by UPI or card, and the app records what each of the others owes them.[cite: 1]
+• Everyone pays their own share, and the order goes through once all shares are in.[cite: 1]
+The first is faster.[cite: 1] The second means nobody chases anyone afterwards.[cite: 1]
+
+Step 8 Track, receive, settle up[cite: 1]
+Everyone in the cart gets the live tracking screen rider name, number, map not just the person who paid.[cite: 1]
+When the order arrives, check the items against the list before the rider leaves.[cite: 1] If one person paid upfront, the outstanding amounts stay visible under Balances until they're settled, and the app nudges whoever still owes.[cite: 1]
+Missing or damaged items go through Orders → Help.[cite: 1] The refund gets split the same way the bill was.[cite: 1]
+
+How the split is calculated[cite: 1]
+Take a 840 order between three people:[cite: 1]
+| Pratiti | Kalpana | Shreeya[cite: 1]
+Own Items | 250 | 235 | 175[cite: 1]
+Share of rice + oil (180 + 3) | 60 | 60 | 60[cite: 1]
+Total owed | 310 | 295 | 235[cite: 1]
+Anything marked Shared is divided equally between everyone in the cart at the moment of checkout.[cite: 1] Everything else sits with the person who added it.[cite: 1]
+
+Worth knowing[cite: 1]
+One address per cart.[cite: 1] If two people in the cart live in different places, split it into two orders.[cite: 1]
+Reassigning items.[cite: 1] Tagged to the wrong person?[cite: 1] Anyone in the cart can move an item until checkout locks it.[cite: 1] After that, it's fixed.[cite: 1]
+Leaving a cart.[cite: 1] If you exit before checkout, your items go with you and the split recalculates for whoever's left.[cite: 1]
+Late payers.[cite: 1] In the "everyone pays their own share" mode, the order doesn't reach the store until the last share clears.[cite: 1] If someone's slow, switch to one-person-pays and settle it later.[cite: 1]"""
+
+# GitHub API requires the content to be Base64 encoded
+encoded_content = base64.b64encode(file_content.encode('utf-8')).decode('utf-8')
+
+# API URL for creating or updating a file
+url = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/contents/{FILE_PATH}"
+
+headers = {
+    "Authorization": f"Bearer {GITHUB_TOKEN}",
+    "Accept": "application/vnd.github.v3+json"
+}
+
+data = {
+    "message": COMMIT_MESSAGE,
+    "content": encoded_content
+}
+
+# Make the PUT request to create the file
+response = requests.put(url, headers=headers, data=json.dumps(data))
+
+if response.status_code == 201:
+    print(f"Successfully created {FILE_PATH} in the repository.")
+else:
+    print(f"Failed to create file. Status code: {response.status_code}")
+    print(response.json())
