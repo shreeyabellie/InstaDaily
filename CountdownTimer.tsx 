@@ -1,0 +1,154 @@
+"use client";
+
+import React, { useState, useEffect, useMemo, useRef } from "react";
+
+export interface CountdownTimerProps {
+  /**
+   * The expected delivery timestamp. Accepts a Date object, an ISO string, or a Unix timestamp (ms).
+   */
+  estimatedDeliveryTime: Date | string | number;
+  /**
+   * The timestamp when the order was placed. Used to calculate the full duration for the progress bar.
+   * If omitted, it assumes a standard 10-minute quick-commerce delivery window.
+   */
+  orderedAt?: Date | string | number;
+  /**
+   * Callback triggered exactly once when the countdown reaches exactly zero.
+   */
+  onTimerExpire?: () => void;
+  /**
+   * Additional classNames for the root container.
+   */
+  className?: string;
+}
+
+export const CountdownTimer: React.FC<CountdownTimerProps> = ({
+  estimatedDeliveryTime,
+  orderedAt,
+  onTimerExpire,
+  className = "",
+}) => {
+  const targetTime = useMemo(() => new Date(estimatedDeliveryTime).getTime(), [estimatedDeliveryTime]);
+  
+  const startTime = useMemo(() => {
+    if (orderedAt) return new Date(orderedAt).getTime();
+    // Default fallback: 10 minutes (600,000 milliseconds) prior to the delivery time
+    return targetTime - 10 * 60 * 1000;
+  }, [orderedAt, targetTime]);
+
+  const totalDurationMs = Math.max(targetTime - startTime, 1000); // Minimum 1 second to avoid division by zero
+
+  const calculateRemainingMs = (): number => Math.max(targetTime - Date.now(), 0);
+
+  const [remainingMs, setRemainingMs] = useState<number>(calculateRemainingMs);
+  const [isExpired, setIsExpired] = useState<boolean>(remainingMs <= 0);
+  
+  // Use a ref to ensure the onTimerExpire callback is only called once per lifecycle
+  const hasNotifiedExpire = useRef<boolean>(remainingMs <= 0);
+
+  useEffect(() => {
+    // Immediate check on mount in case the delivery time is already in the past
+    if (targetTime <= Date.now()) {
+      setRemainingMs(0);
+      setIsExpired(true);
+      if (onTimerExpire && !hasNotifiedExpire.current) {
+        hasNotifiedExpire.current = true;
+        onTimerExpire();
+      }
+      return;
+    }
+
+    // Reset notification state if targetTime changes to a future date
+    hasNotifiedExpire.current = false;
+    setIsExpired(false);
+
+    const intervalId = setInterval(() => {
+      const currentRemaining = calculateRemainingMs();
+      
+      if (currentRemaining <= 0) {
+        setRemainingMs(0);
+        setIsExpired(true);
+        clearInterval(intervalId);
+        
+        if (onTimerExpire && !hasNotifiedExpire.current) {
+          hasNotifiedExpire.current = true;
+          onTimerExpire();
+        }
+      } else {
+        setRemainingMs(currentRemaining);
+      }
+    }, 1000);
+
+    return () => clearInterval(intervalId);
+  }, [targetTime, onTimerExpire]);
+
+  // Format the remaining time into strict MM:SS format
+  const formattedTime = useMemo(() => {
+    // Math.ceil ensures that 9.1 seconds displays as 00:10 until it hits exactly 9.0
+    const totalSeconds = Math.ceil(remainingMs / 1000);
+    const minutes = Math.floor(totalSeconds / 60);
+    const seconds = totalSeconds % 60;
+    
+    const paddedMinutes = minutes.toString().padStart(2, "0");
+    const paddedSeconds = seconds.toString().padStart(2, "0");
+    
+    return `${paddedMinutes}:${paddedSeconds}`;
+  }, [remainingMs]);
+
+  // Calculate progress percentage from 100 down to 0
+  const progressPercentage = useMemo(() => {
+    if (isExpired) return 0;
+    const percentage = (remainingMs / totalDurationMs) * 100;
+    return Math.min(Math.max(percentage, 0), 100);
+  }, [remainingMs, totalDurationMs, isExpired]);
+
+  return (
+    <div 
+      className={`bg-white dark:bg-zinc-900 border border-zinc-100 dark:border-zinc-800 rounded-[24px] p-6 shadow-sm flex flex-col w-full max-w-md ${className}`}
+      role="timer"
+      aria-live="polite"
+    >
+      <div className="flex flex-col items-center justify-center text-center space-y-2">
+        <h2 className="text-sm font-medium text-zinc-500 dark:text-zinc-400 tracking-wide uppercase">
+          Delivery Estimate
+        </h2>
+        
+        <div className="h-12 flex items-center justify-center">
+          {isExpired ? (
+            <span className="text-xl md:text-2xl font-semibold text-[#F97316] animate-pulse">
+              Arriving momentarily...
+            </span>
+          ) : (
+            <span 
+              className="text-4xl md:text-5xl font-extrabold tracking-tighter text-zinc-900 dark:text-white font-mono tabular-nums"
+              aria-label={`${formattedTime} remaining`}
+            >
+              {formattedTime}
+            </span>
+          )}
+        </div>
+      </div>
+
+      <div className="mt-6">
+        <div 
+          className="h-2 md:h-3 w-full bg-zinc-100 dark:bg-zinc-800 rounded-full overflow-hidden"
+          role="progressbar"
+          aria-valuenow={progressPercentage}
+          aria-valuemin={0}
+          aria-valuemax={100}
+        >
+          <div
+            className="h-full bg-[#F97316] rounded-full transition-all duration-1000 ease-linear"
+            style={{ width: `${progressPercentage}%` }}
+          />
+        </div>
+        
+        {!isExpired && (
+          <p className="mt-3 text-xs text-center text-zinc-400 dark:text-zinc-500">
+            Fresh groceries, speeding to your door.
+          </p>
+        )}
+      </div>
+    </div>
+  );
+};
