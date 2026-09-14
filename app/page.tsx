@@ -5,6 +5,8 @@ import { SearchBar } from '@/components/Shop/SearchBar';
 import { ExpressModeToggle } from '@/components/Shop/ExpressModeToggle';
 import { Container } from '@instadaily/ui/components/Container';
 import { Section } from '@instadaily/ui/components/Section';
+import ProductCatalog, { type StoreProduct } from './ProductCatalog';
+import { createClient } from '../apps/web/lib/supabase/server';
 
 interface Product {
   id: string;
@@ -279,8 +281,33 @@ function SectionHeader({ title, subtitle, href }: SectionHeaderProps): React.JSX
   );
 }
 
-export default function ShopHomePage(): React.JSX.Element {
+export default async function ShopHomePage(): Promise<React.JSX.Element> {
+  const supabase = await createClient();
+  const { data, error } = await supabase
+    .from('products')
+    .select('id, name, slug, unit, pack_size, selling_price_paise, mrp_paise, delivery_eta_minutes, brands(name)')
+    .eq('is_active', true)
+    .order('name');
+
   return (
+    <main className="min-h-screen bg-neutral-50 p-6 dark:bg-neutral-950">
+      <header className="mb-8">
+        <p className="text-sm">Delivering to Home — Koramangala, Bengaluru</p>
+        <h1 className="text-3xl font-bold">InstaDaily</h1>
+        <nav><Link href="/orders/frequent">Frequent purchases</Link>{' · '}<Link href="/sign-in">Sign in</Link></nav>
+      </header>
+      <section>
+        <h2 className="mb-4 text-2xl font-bold">Shop groceries</h2>
+        {error ? <p role="alert">Unable to load products: {error.message}</p> : <ProductCatalog products={(data ?? []) as StoreProduct[]} />}
+      </section>
+      <section className="mt-8">
+        <h2 className="text-2xl font-bold">Chef Mode</h2>
+        <Link href="/chef-mode/recipe_paneer_butter_masala">Cook Paneer Butter Masala</Link>
+      </section>
+    </main>
+  );
+
+  /* Legacy mock catalogue retained below for design reference only.
     <main className="min-h-screen bg-neutral-50 pb-24 dark:bg-neutral-950">
       <header className="sticky top-0 z-20 border-b border-neutral-200 bg-white/95 backdrop-blur-sm dark:border-neutral-800 dark:bg-neutral-950/95">
         <Container>
@@ -388,4 +415,5 @@ export default function ShopHomePage(): React.JSX.Element {
       </Section>
     </main>
   );
+  */
 }
