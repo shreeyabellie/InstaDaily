@@ -1,8 +1,8 @@
 {
   "compilerOptions": {
     "jsx": "react-jsx",
-    "moduleResolution": "node",
-    "baseUrl": ".",
+    "moduleResolution": "bundler",
+    "skipLibCheck": true,
     "paths": {
       "@/*": ["./*"],
       "@instadaily/ui/*": ["./packages/ui/src/*"]

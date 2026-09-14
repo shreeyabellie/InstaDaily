@@ -1,2 +1,9 @@
+node_modules/
 **/node_modules/
 .next/
+
+# Local environment files — never commit real Supabase credentials.
+# .env.local.example is intentionally tracked as the template.
+.env
+.env.local
+.env.*.local
