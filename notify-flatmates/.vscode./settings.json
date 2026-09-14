@@ -1,0 +1,7 @@
+
+{
+  "deno.enablePaths": [
+    "notify-flatmates" 
+  ],
+  "deno.unstable": true
+}
