@@ -1,511 +1,1436 @@
--- ============================================================
--- InstaDaily: Collaborative Sync Cart Schema & Realtime Functions
--- Migration: 02_sync_cart_schema.sql
--- Role: Member 4 (Database Schema & Realtime WebSockets)
--- ============================================================
+-- =============================================================================
+-- InstaDaily — Sync Cart Schema
+-- File: supabase/migrations/02_sync_cart_schema.sql
+-- Target: PostgreSQL 15+ / Supabase
+--
+-- Purpose:
+--   Shared cart membership, secure share links, collaborative editing,
+--   optimistic concurrency metadata, conflict tracking, RLS, and Realtime.
+--
+-- Depends on:
+--   01_initial_schema.sql
+-- =============================================================================
 
--- This migration extends the foundational carts, cart_members, and
--- cart_items tables created in 01_initial_schema.sql.
--- IT DOES NOT DUPLICATE FOUNDATIONAL CART TABLES.
 
--- ------------------------------------------------------------
--- 1. REPLICA IDENTITY FOR REALTIME WEBSOCKET DELETES
--- ------------------------------------------------------------
--- REPLICA IDENTITY FULL ensures DELETE events via Supabase Realtime
--- send the complete old record to all subscribed clients.
-ALTER TABLE public.cart_items REPLICA IDENTITY FULL;
-ALTER TABLE public.cart_members REPLICA IDENTITY FULL;
-ALTER TABLE public.carts REPLICA IDENTITY FULL;
+-- =============================================================================
+-- SECTION 1: ENUM TYPES
+-- =============================================================================
 
--- ------------------------------------------------------------
--- 2. SECURITY HELPER FUNCTIONS
--- ------------------------------------------------------------
-
--- Check if a user is an active member or owner of a cart
-CREATE OR REPLACE FUNCTION public.is_cart_member(p_cart_id UUID, p_user_id UUID)
-RETURNS BOOLEAN AS $$
-BEGIN
-    RETURN EXISTS (
-        SELECT 1 FROM public.carts WHERE id = p_cart_id AND owner_id = p_user_id
-    ) OR EXISTS (
-        SELECT 1 FROM public.cart_members WHERE cart_id = p_cart_id AND user_id = p_user_id
+do $$
+begin
+  if not exists (
+    select 1
+    from pg_type
+    where typname = 'membership_role'
+      and typnamespace = 'public'::regnamespace
+  ) then
+    create type public.membership_role as enum (
+      'owner',
+      'editor',
+      'viewer'
     );
-END;
-$$ LANGUAGE plpgsql STABLE SECURITY DEFINER;
-
--- Check if a user is the owner or admin of a cart
-CREATE OR REPLACE FUNCTION public.is_cart_owner_or_admin(p_cart_id UUID, p_user_id UUID)
-RETURNS BOOLEAN AS $$
-BEGIN
-    RETURN EXISTS (
-        SELECT 1 FROM public.carts WHERE id = p_cart_id AND owner_id = p_user_id
-    ) OR EXISTS (
-        SELECT 1 FROM public.cart_members WHERE cart_id = p_cart_id AND user_id = p_user_id AND role IN ('owner', 'admin')
-    );
-END;
-$$ LANGUAGE plpgsql STABLE SECURITY DEFINER;
-
--- ------------------------------------------------------------
--- 3. SECURE SHARE LINKS & CONFLICT AUDITING TABLES
--- ------------------------------------------------------------
-
--- CART SHARE LINKS
--- Cryptographically hashed tokens for secure invite links with expiration/revocation
-CREATE TABLE IF NOT EXISTS public.cart_share_links (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    cart_id UUID NOT NULL REFERENCES public.carts(id) ON DELETE CASCADE,
-    created_by UUID NOT NULL REFERENCES public.profiles(id) ON DELETE CASCADE,
-    share_token_hash TEXT NOT NULL UNIQUE,
-    role TEXT NOT NULL DEFAULT 'member' CHECK (role IN ('owner', 'admin', 'member', 'editor', 'viewer')),
-    expires_at TIMESTAMPTZ,
-    is_revoked BOOLEAN DEFAULT false NOT NULL,
-    created_at TIMESTAMPTZ DEFAULT now() NOT NULL
-);
-
--- CART ITEM CONFLICTS
--- Records concurrent additions of identical products for ConflictModal resolution
-CREATE TABLE IF NOT EXISTS public.cart_item_conflicts (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    cart_id UUID NOT NULL REFERENCES public.carts(id) ON DELETE CASCADE,
-    product_id UUID NOT NULL REFERENCES public.products(id) ON DELETE CASCADE,
-    existing_item_id UUID REFERENCES public.cart_items(id) ON DELETE SET NULL,
-    existing_quantity INTEGER NOT NULL CHECK (existing_quantity > 0),
-    incoming_quantity INTEGER NOT NULL CHECK (incoming_quantity > 0),
-    initiated_by UUID NOT NULL REFERENCES public.profiles(id) ON DELETE CASCADE,
-    resolution_status TEXT NOT NULL DEFAULT 'pending' CHECK (resolution_status IN ('pending', 'keep_both', 'merge', 'dismissed')),
-    resolved_at TIMESTAMPTZ,
-    created_at TIMESTAMPTZ DEFAULT now() NOT NULL
-);
-
--- Indexes for Sync Cart extensions
-CREATE INDEX IF NOT EXISTS idx_cart_share_links_cart ON public.cart_share_links(cart_id);
-CREATE INDEX IF NOT EXISTS idx_cart_share_links_hash ON public.cart_share_links(share_token_hash);
-CREATE INDEX IF NOT EXISTS idx_cart_conflicts_cart ON public.cart_item_conflicts(cart_id);
-CREATE INDEX IF NOT EXISTS idx_cart_conflicts_status ON public.cart_item_conflicts(cart_id, resolution_status);
-
--- Enable RLS
-ALTER TABLE public.cart_share_links ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.cart_item_conflicts ENABLE ROW LEVEL SECURITY;
-
--- RLS: Cart members can view share links; owners and admins can create/update them
-CREATE POLICY "Cart members view share links" ON public.cart_share_links FOR SELECT USING (
-    public.is_cart_member(cart_id, auth.uid())
-);
-CREATE POLICY "Owners and admins manage share links" ON public.cart_share_links FOR ALL USING (
-    public.is_cart_owner_or_admin(cart_id, auth.uid())
-);
-
--- RLS: Cart members can view and resolve cart item conflicts
-CREATE POLICY "Cart members view conflicts" ON public.cart_item_conflicts FOR SELECT USING (
-    public.is_cart_member(cart_id, auth.uid())
-);
-CREATE POLICY "Cart members create conflicts" ON public.cart_item_conflicts FOR INSERT WITH CHECK (
-    public.is_cart_member(cart_id, auth.uid())
-);
-CREATE POLICY "Cart members update conflicts" ON public.cart_item_conflicts FOR UPDATE USING (
-    public.is_cart_member(cart_id, auth.uid())
-);
-
--- Realtime for conflicts
-ALTER TABLE public.cart_item_conflicts REPLICA IDENTITY FULL;
-
-DO $$
-BEGIN
-    IF NOT EXISTS (
-        SELECT 1 FROM pg_publication_tables 
-        WHERE pubname = 'supabase_realtime' AND tablename = 'cart_item_conflicts'
-    ) THEN
-        ALTER PUBLICATION supabase_realtime ADD TABLE public.cart_item_conflicts;
-    END IF;
-EXCEPTION
-    WHEN undefined_object THEN
-        NULL;
-END;
+  end if;
+end
 $$;
 
--- ------------------------------------------------------------
--- 4. CART CREATION & SHARING RPCs
--- ------------------------------------------------------------
 
--- Generate unique 6-character alphanumeric share code
-CREATE OR REPLACE FUNCTION public.generate_unique_cart_share_code()
-RETURNS TEXT AS $$
-DECLARE
-    v_code TEXT;
-    v_exists BOOLEAN;
-BEGIN
-    LOOP
-        v_code := UPPER(SUBSTRING(MD5(RANDOM()::TEXT || CLOCK_TIMESTAMP()::TEXT) FROM 1 FOR 6));
-        SELECT EXISTS (SELECT 1 FROM public.carts WHERE share_code = v_code) INTO v_exists;
-        EXIT WHEN NOT v_exists;
-    END LOOP;
-    RETURN v_code;
-END;
-$$ LANGUAGE plpgsql VOLATILE;
+do $$
+begin
+  if not exists (
+    select 1
+    from pg_type
+    where typname = 'membership_status'
+      and typnamespace = 'public'::regnamespace
+  ) then
+    create type public.membership_status as enum (
+      'invited',
+      'active',
+      'removed'
+    );
+  end if;
+end
+$$;
 
--- RPC: Create a shared cart and register creator as owner member
-CREATE OR REPLACE FUNCTION public.create_shared_cart(
-    p_name TEXT DEFAULT 'Shared Cart',
-    p_billing_type TEXT DEFAULT 'single'
+
+-- =============================================================================
+-- SECTION 2: CART MEMBERS
+-- =============================================================================
+
+create table if not exists public.cart_members (
+  id uuid primary key default gen_random_uuid(),
+
+  cart_id uuid not null
+    references public.carts(id)
+    on delete cascade,
+
+  user_id uuid not null
+    references public.profiles(id)
+    on delete cascade,
+
+  role public.membership_role not null default 'editor',
+
+  status public.membership_status not null default 'active',
+
+  invited_at timestamptz,
+
+  joined_at timestamptz,
+
+  last_active_at timestamptz,
+
+  created_at timestamptz not null default now(),
+
+  updated_at timestamptz not null default now(),
+
+  constraint cart_members_cart_user_unique
+    unique (cart_id, user_id),
+
+  constraint cart_members_joined_at_check
+    check (
+      status <> 'active'
+      or joined_at is not null
+    ),
+
+  constraint cart_members_invited_at_check
+    check (
+      status = 'invited'
+      or invited_at is not null
+      or role = 'owner'
+    )
+);
+
+
+-- =============================================================================
+-- SECTION 3: SECURE CART SHARE LINKS
+-- =============================================================================
+
+create table if not exists public.cart_share_links (
+  id uuid primary key default gen_random_uuid(),
+
+  cart_id uuid not null
+    references public.carts(id)
+    on delete cascade,
+
+  token_hash bytea not null,
+
+  expires_at timestamptz,
+
+  revoked_at timestamptz,
+
+  created_by uuid not null
+    references public.profiles(id)
+    on delete restrict,
+
+  created_at timestamptz not null default now(),
+
+  constraint cart_share_links_token_hash_unique
+    unique (token_hash),
+
+  constraint cart_share_links_expiry_check
+    check (
+      expires_at is null
+      or expires_at > created_at
+    ),
+
+  constraint cart_share_links_revoked_check
+    check (
+      revoked_at is null
+      or revoked_at >= created_at
+    )
+);
+
+
+-- =============================================================================
+-- SECTION 4: SYNC METADATA FOR CART ITEMS
+-- =============================================================================
+
+alter table public.cart_items
+  add column if not exists version bigint not null default 1;
+
+
+alter table public.cart_items
+  add column if not exists updated_by uuid
+    references public.profiles(id)
+    on delete set null;
+
+
+alter table public.cart_items
+  add column if not exists client_mutation_id uuid;
+
+
+alter table public.cart_items
+  add column if not exists last_synced_at timestamptz
+    not null default now();
+
+
+-- =============================================================================
+-- SECTION 5: CART SYNC METADATA
+-- =============================================================================
+
+alter table public.carts
+  add column if not exists version bigint not null default 1;
+
+
+alter table public.carts
+  add column if not exists last_modified_by uuid
+    references public.profiles(id)
+    on delete set null;
+
+
+alter table public.carts
+  add column if not exists share_enabled boolean
+    not null default false;
+
+
+-- =============================================================================
+-- SECTION 6: CONFLICT RECORDS
+-- =============================================================================
+
+create table if not exists public.cart_item_conflicts (
+  id uuid primary key default gen_random_uuid(),
+
+  cart_id uuid not null
+    references public.carts(id)
+    on delete cascade,
+
+  cart_item_id uuid
+    references public.cart_items(id)
+    on delete set null,
+
+  product_id uuid not null
+    references public.products(id)
+    on delete restrict,
+
+  existing_quantity integer not null
+    check (existing_quantity > 0),
+
+  incoming_quantity integer not null
+    check (incoming_quantity > 0),
+
+  existing_version bigint not null
+    check (existing_version > 0),
+
+  incoming_version bigint not null
+    check (incoming_version > 0),
+
+  existing_updated_by uuid
+    references public.profiles(id)
+    on delete set null,
+
+  incoming_updated_by uuid
+    references public.profiles(id)
+    on delete set null,
+
+  client_mutation_id uuid,
+
+  resolution text
+    not null default 'pending',
+
+  resolved_quantity integer,
+
+  resolved_by uuid
+    references public.profiles(id)
+    on delete set null,
+
+  resolved_at timestamptz,
+
+  created_at timestamptz not null default now(),
+
+  constraint cart_item_conflicts_resolution_check
+    check (
+      resolution in (
+        'pending',
+        'keep_both',
+        'merge'
+      )
+    ),
+
+  constraint cart_item_conflicts_resolved_data_check
+    check (
+      (
+        resolution = 'pending'
+        and resolved_quantity is null
+        and resolved_by is null
+        and resolved_at is null
+      )
+      or
+      (
+        resolution in ('keep_both', 'merge')
+        and resolved_quantity is not null
+        and resolved_quantity > 0
+        and resolved_by is not null
+        and resolved_at is not null
+      )
+    )
+);
+
+
+-- =============================================================================
+-- SECTION 7: HELPER FUNCTIONS
+-- =============================================================================
+
+create or replace function public.is_cart_member(
+  p_cart_id uuid,
+  p_user_id uuid default auth.uid()
 )
-RETURNS JSONB AS $$
-DECLARE
-    v_user_id UUID;
-    v_cart_id UUID;
-    v_share_code TEXT;
-BEGIN
-    v_user_id := auth.uid();
-    IF v_user_id IS NULL THEN
-        RAISE EXCEPTION 'Authentication required to create a shared cart';
-    END IF;
+returns boolean
+language sql
+stable
+security definer
+set search_path = public
+as $$
+  select exists (
+    select 1
+    from public.cart_members cm
+    where cm.cart_id = p_cart_id
+      and cm.user_id = p_user_id
+      and cm.status = 'active'
+  );
+$$;
 
-    v_share_code := public.generate_unique_cart_share_code();
 
-    -- Insert cart using canonical owner_id column
-    INSERT INTO public.carts (
-        owner_id,
-        is_shared,
-        name,
-        share_code,
-        billing_type,
-        status
-    )
-    VALUES (
-        v_user_id,
-        true,
-        COALESCE(p_name, 'Shared Cart'),
-        v_share_code,
-        COALESCE(p_billing_type, 'single'),
-        'active'
-    )
-    RETURNING id INTO v_cart_id;
-
-    -- Add creator as owner in cart_members
-    INSERT INTO public.cart_members (
-        cart_id,
-        user_id,
-        role,
-        last_active_at,
-        joined_at
-    )
-    VALUES (
-        v_cart_id,
-        v_user_id,
-        'owner',
-        now(),
-        now()
-    )
-    ON CONFLICT (cart_id, user_id) DO UPDATE
-    SET role = 'owner', last_active_at = now();
-
-    RETURN jsonb_build_object(
-        'cart_id', v_cart_id,
-        'name', p_name,
-        'share_code', v_share_code,
-        'role', 'owner',
-        'is_shared', true
-    );
-END;
-$$ LANGUAGE plpgsql SECURITY DEFINER;
-
--- RPC: Join cart by share code
-CREATE OR REPLACE FUNCTION public.join_cart_by_share_code(p_share_code TEXT)
-RETURNS JSONB AS $$
-DECLARE
-    v_user_id UUID;
-    v_cart RECORD;
-    v_existing_role TEXT;
-BEGIN
-    v_user_id := auth.uid();
-    IF v_user_id IS NULL THEN
-        RAISE EXCEPTION 'Authentication required to join cart';
-    END IF;
-
-    SELECT id, name, is_locked, status, owner_id
-    INTO v_cart
-    FROM public.carts
-    WHERE UPPER(share_code) = UPPER(TRIM(p_share_code))
-      AND status = 'active';
-
-    IF NOT FOUND THEN
-        RAISE EXCEPTION 'Invalid or expired cart share code';
-    END IF;
-
-    -- Check existing role or assign member
-    SELECT role INTO v_existing_role
-    FROM public.cart_members
-    WHERE cart_id = v_cart.id AND user_id = v_user_id;
-
-    IF v_existing_role IS NULL THEN
-        INSERT INTO public.cart_members (
-            cart_id,
-            user_id,
-            role,
-            last_active_at,
-            joined_at
-        )
-        VALUES (
-            v_cart.id,
-            v_user_id,
-            CASE WHEN v_cart.owner_id = v_user_id THEN 'owner' ELSE 'member' END,
-            now(),
-            now()
-        );
-        v_existing_role := CASE WHEN v_cart.owner_id = v_user_id THEN 'owner' ELSE 'member' END;
-    ELSE
-        UPDATE public.cart_members
-        SET last_active_at = now()
-        WHERE cart_id = v_cart.id AND user_id = v_user_id;
-    END IF;
-
-    RETURN jsonb_build_object(
-        'cart_id', v_cart.id,
-        'name', v_cart.name,
-        'role', v_existing_role,
-        'is_locked', v_cart.is_locked
-    );
-END;
-$$ LANGUAGE plpgsql SECURITY DEFINER;
-
--- ------------------------------------------------------------
--- 5. CONCURRENT ITEM ADDITIONS & DUPLICATE CONFLICT RESOLUTION
--- ------------------------------------------------------------
--- Supports ConflictModal with 3 modes:
--- 1. 'detect_only': Checks if product is already in cart, logging conflict record and returning info
--- 2. 'merge': Merges quantity into existing item
--- 3. 'keep_both': Inserts distinct item with addition_token for concurrent distinction
-CREATE OR REPLACE FUNCTION public.add_or_merge_cart_item(
-    p_cart_id UUID,
-    p_product_id UUID,
-    p_quantity INTEGER DEFAULT 1,
-    p_is_shared BOOLEAN DEFAULT false,
-    p_assigned_to UUID DEFAULT NULL,
-    p_addition_token TEXT DEFAULT NULL,
-    p_merge_mode TEXT DEFAULT 'detect_only'
+create or replace function public.is_cart_owner(
+  p_cart_id uuid,
+  p_user_id uuid default auth.uid()
 )
-RETURNS JSONB AS $$
-DECLARE
-    v_user_id UUID;
-    v_cart_locked BOOLEAN;
-    v_unit_price INTEGER;
-    v_existing_item RECORD;
-    v_new_item_id UUID;
-    v_conflict_id UUID;
-BEGIN
-    v_user_id := auth.uid();
-    IF v_user_id IS NULL THEN
-        RAISE EXCEPTION 'Authentication required to modify cart';
-    END IF;
+returns boolean
+language sql
+stable
+security definer
+set search_path = public
+as $$
+  select exists (
+    select 1
+    from public.cart_members cm
+    where cm.cart_id = p_cart_id
+      and cm.user_id = p_user_id
+      and cm.role = 'owner'
+      and cm.status = 'active'
+  );
+$$;
 
-    -- Validate cart membership
-    IF NOT public.is_cart_member(p_cart_id, v_user_id) THEN
-        RAISE EXCEPTION 'Permission denied: user is not a member of this cart';
-    END IF;
 
-    -- Validate cart lock status
-    SELECT is_locked INTO v_cart_locked FROM public.carts WHERE id = p_cart_id;
-    IF v_cart_locked THEN
-        RAISE EXCEPTION 'Cart is currently locked for checkout';
-    END IF;
+create or replace function public.can_edit_cart(
+  p_cart_id uuid,
+  p_user_id uuid default auth.uid()
+)
+returns boolean
+language sql
+stable
+security definer
+set search_path = public
+as $$
+  select exists (
+    select 1
+    from public.cart_members cm
+    where cm.cart_id = p_cart_id
+      and cm.user_id = p_user_id
+      and cm.status = 'active'
+      and cm.role in ('owner', 'editor')
+  );
+$$;
 
-    -- Validate quantity
-    IF p_quantity <= 0 THEN
-        RAISE EXCEPTION 'Quantity must be greater than zero';
-    END IF;
 
-    -- Get live product selling price
-    SELECT selling_price_paise INTO v_unit_price
-    FROM public.products
-    WHERE id = p_product_id AND is_active = true;
+create or replace function public.can_view_cart(
+  p_cart_id uuid,
+  p_user_id uuid default auth.uid()
+)
+returns boolean
+language sql
+stable
+security definer
+set search_path = public
+as $$
+  select public.is_cart_member(p_cart_id, p_user_id);
+$$;
 
-    IF NOT FOUND THEN
-        RAISE EXCEPTION 'Product not found or inactive';
-    END IF;
 
-    -- Check for existing item with this product in the cart
-    SELECT id, quantity, added_by, is_shared
-    INTO v_existing_item
-    FROM public.cart_items
-    WHERE cart_id = p_cart_id AND product_id = p_product_id
-    LIMIT 1;
+-- =============================================================================
+-- SECTION 8: SECURE SHARE TOKEN HASHING
+-- =============================================================================
 
-    -- Mode 1: detect_only (Prompts user via UI ConflictModal)
-    IF v_existing_item.id IS NOT NULL AND p_merge_mode = 'detect_only' THEN
-        -- Record conflict audit record
-        INSERT INTO public.cart_item_conflicts (
-            cart_id,
-            product_id,
-            existing_item_id,
-            existing_quantity,
-            incoming_quantity,
-            initiated_by,
-            resolution_status
-        )
-        VALUES (
-            p_cart_id,
-            p_product_id,
-            v_existing_item.id,
-            v_existing_item.quantity,
-            p_quantity,
-            v_user_id,
-            'pending'
-        )
-        RETURNING id INTO v_conflict_id;
+create or replace function public.hash_cart_share_token(
+  p_token text
+)
+returns bytea
+language sql
+immutable
+security definer
+set search_path = public
+as $$
+  select digest(p_token, 'sha256');
+$$;
 
-        RETURN jsonb_build_object(
-            'conflict', true,
-            'conflict_id', v_conflict_id,
-            'existing_item_id', v_existing_item.id,
-            'existing_quantity', v_existing_item.quantity,
-            'product_id', p_product_id,
-            'message', 'Item already exists in cart'
-        );
-    END IF;
 
-    -- Mode 2: merge (Increments quantity on existing item)
-    IF v_existing_item.id IS NOT NULL AND p_merge_mode = 'merge' THEN
-        UPDATE public.cart_items
-        SET quantity = quantity + p_quantity,
-            unit_price_paise = v_unit_price,
-            updated_at = now()
-        WHERE id = v_existing_item.id;
+-- =============================================================================
+-- SECTION 9: CART OWNER MEMBERSHIP
+-- =============================================================================
 
-        -- Update any pending conflict records for this cart and product
-        UPDATE public.cart_item_conflicts
-        SET resolution_status = 'merge',
-            resolved_at = now()
-        WHERE cart_id = p_cart_id AND product_id = p_product_id AND resolution_status = 'pending';
+create or replace function public.fn_add_cart_owner()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  insert into public.cart_members (
+    cart_id,
+    user_id,
+    role,
+    status,
+    invited_at,
+    joined_at,
+    last_active_at
+  )
+  values (
+    new.id,
+    new.user_id,
+    'owner',
+    'active',
+    now(),
+    now(),
+    now()
+  )
+  on conflict (cart_id, user_id)
+  do update
+  set
+    role = 'owner',
+    status = 'active',
+    joined_at = coalesce(public.cart_members.joined_at, now()),
+    last_active_at = now(),
+    updated_at = now();
 
-        RETURN jsonb_build_object(
-            'conflict', false,
-            'action', 'merged',
-            'cart_item_id', v_existing_item.id,
-            'new_quantity', v_existing_item.quantity + p_quantity
-        );
-    END IF;
+  return new;
+end;
+$$;
 
-    -- Mode 3: keep_both or brand new item addition
-    INSERT INTO public.cart_items (
-        cart_id,
-        product_id,
-        added_by,
-        assigned_to,
-        quantity,
-        unit_price_paise,
-        is_shared,
-        addition_token
+
+drop trigger if exists carts_add_owner_trigger
+on public.carts;
+
+
+create trigger carts_add_owner_trigger
+after insert
+on public.carts
+for each row
+execute function public.fn_add_cart_owner();
+
+
+-- =============================================================================
+-- SECTION 10: BACKFILL EXISTING CART OWNERS
+-- =============================================================================
+
+insert into public.cart_members (
+  cart_id,
+  user_id,
+  role,
+  status,
+  invited_at,
+  joined_at,
+  last_active_at
+)
+select
+  c.id,
+  c.user_id,
+  'owner',
+  'active',
+  c.created_at,
+  c.created_at,
+  c.updated_at
+from public.carts c
+where c.user_id is not null
+on conflict (cart_id, user_id)
+do update
+set
+  role = 'owner',
+  status = 'active',
+  joined_at = coalesce(
+    public.cart_members.joined_at,
+    excluded.joined_at
+  ),
+  last_active_at = excluded.last_active_at,
+  updated_at = now();
+
+
+-- =============================================================================
+-- SECTION 11: SHARE LINK CREATION
+-- =============================================================================
+
+create or replace function public.create_cart_share_link(
+  p_cart_id uuid,
+  p_expires_at timestamptz default now() + interval '7 days'
+)
+returns table (
+  share_link_id uuid,
+  share_token text,
+  expires_at timestamptz
+)
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_token text;
+  v_token_hash bytea;
+  v_link_id uuid;
+  v_expires_at timestamptz;
+begin
+  if auth.uid() is null then
+    raise exception 'Authentication required';
+  end if;
+
+  if not public.is_cart_owner(p_cart_id, auth.uid()) then
+    raise exception 'Only the cart owner can create a share link';
+  end if;
+
+  if not exists (
+    select 1
+    from public.carts
+    where id = p_cart_id
+      and status = 'active'
+  ) then
+    raise exception 'Cart is not active';
+  end if;
+
+  if p_expires_at is not null
+     and p_expires_at <= now() then
+    raise exception 'Share link expiry must be in the future';
+  end if;
+
+  v_token := encode(gen_random_bytes(32), 'base64url');
+
+  v_token_hash := digest(v_token, 'sha256');
+
+  v_expires_at := p_expires_at;
+
+  insert into public.cart_share_links (
+    cart_id,
+    token_hash,
+    expires_at,
+    created_by
+  )
+  values (
+    p_cart_id,
+    v_token_hash,
+    v_expires_at,
+    auth.uid()
+  )
+  returning id
+  into v_link_id;
+
+  update public.carts
+  set
+    share_enabled = true,
+    version = version + 1,
+    last_modified_by = auth.uid(),
+    updated_at = now()
+  where id = p_cart_id;
+
+  return query
+  select
+    v_link_id,
+    v_token,
+    v_expires_at;
+end;
+$$;
+
+
+-- =============================================================================
+-- SECTION 12: JOIN CART USING SHARE TOKEN
+-- =============================================================================
+
+create or replace function public.join_cart_with_share_token(
+  p_token text
+)
+returns uuid
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_token_hash bytea;
+  v_cart_id uuid;
+  v_user_id uuid;
+begin
+  v_user_id := auth.uid();
+
+  if v_user_id is null then
+    raise exception 'Authentication required';
+  end if;
+
+  if p_token is null or length(trim(p_token)) < 20 then
+    raise exception 'Invalid share token';
+  end if;
+
+  v_token_hash := digest(trim(p_token), 'sha256');
+
+  select csl.cart_id
+  into v_cart_id
+  from public.cart_share_links csl
+  where csl.token_hash = v_token_hash
+    and csl.revoked_at is null
+    and (
+      csl.expires_at is null
+      or csl.expires_at > now()
     )
-    VALUES (
-        p_cart_id,
-        p_product_id,
-        v_user_id,
-        COALESCE(p_assigned_to, v_user_id),
-        p_quantity,
-        v_unit_price,
-        p_is_shared,
-        COALESCE(p_addition_token, gen_random_uuid()::TEXT)
+  limit 1;
+
+  if v_cart_id is null then
+    raise exception 'Share link is invalid or expired';
+  end if;
+
+  if not exists (
+    select 1
+    from public.carts c
+    where c.id = v_cart_id
+      and c.status = 'active'
+  ) then
+    raise exception 'Cart is no longer active';
+  end if;
+
+  insert into public.cart_members (
+    cart_id,
+    user_id,
+    role,
+    status,
+    invited_at,
+    joined_at,
+    last_active_at
+  )
+  values (
+    v_cart_id,
+    v_user_id,
+    'editor',
+    'active',
+    now(),
+    now(),
+    now()
+  )
+  on conflict (cart_id, user_id)
+  do update
+  set
+    status = 'active',
+    joined_at = coalesce(
+      public.cart_members.joined_at,
+      now()
+    ),
+    last_active_at = now(),
+    updated_at = now();
+
+  update public.carts
+  set
+    share_enabled = true,
+    version = version + 1,
+    last_modified_by = v_user_id,
+    updated_at = now()
+  where id = v_cart_id;
+
+  return v_cart_id;
+end;
+$$;
+
+
+-- =============================================================================
+-- SECTION 13: REVOKE SHARE LINK
+-- =============================================================================
+
+create or replace function public.revoke_cart_share_link(
+  p_share_link_id uuid
+)
+returns boolean
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_cart_id uuid;
+begin
+  if auth.uid() is null then
+    raise exception 'Authentication required';
+  end if;
+
+  select cart_id
+  into v_cart_id
+  from public.cart_share_links
+  where id = p_share_link_id;
+
+  if v_cart_id is null then
+    raise exception 'Share link not found';
+  end if;
+
+  if not public.is_cart_owner(v_cart_id, auth.uid()) then
+    raise exception 'Only the cart owner can revoke a share link';
+  end if;
+
+  update public.cart_share_links
+  set revoked_at = coalesce(revoked_at, now())
+  where id = p_share_link_id;
+
+  return true;
+end;
+$$;
+
+
+-- =============================================================================
+-- SECTION 14: UPDATE CART MEMBER ACTIVITY
+-- =============================================================================
+
+create or replace function public.fn_update_cart_member_activity()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  if auth.uid() is not null then
+    update public.cart_members
+    set
+      last_active_at = now(),
+      updated_at = now()
+    where cart_id = new.cart_id
+      and user_id = auth.uid()
+      and status = 'active';
+  end if;
+
+  return new;
+end;
+$$;
+
+
+drop trigger if exists cart_items_member_activity_trigger
+on public.cart_items;
+
+
+create trigger cart_items_member_activity_trigger
+after insert or update or delete
+on public.cart_items
+for each row
+execute function public.fn_update_cart_member_activity();
+
+
+-- =============================================================================
+-- SECTION 15: CART ITEM VERSIONING
+-- =============================================================================
+
+create or replace function public.fn_sync_cart_item_metadata()
+returns trigger
+language plpgsql
+as $$
+begin
+  if tg_op = 'INSERT' then
+
+    new.version := 1;
+
+  elsif tg_op = 'UPDATE' then
+
+    new.version := old.version + 1;
+
+  end if;
+
+  if auth.uid() is not null then
+    new.updated_by := auth.uid();
+  end if;
+
+  new.last_synced_at := now();
+
+  return new;
+end;
+$$;
+
+
+drop trigger if exists cart_items_sync_metadata_trigger
+on public.cart_items;
+
+
+create trigger cart_items_sync_metadata_trigger
+before insert or update
+on public.cart_items
+for each row
+execute function public.fn_sync_cart_item_metadata();
+
+
+-- =============================================================================
+-- SECTION 16: CART VERSIONING
+-- =============================================================================
+
+create or replace function public.fn_sync_cart_metadata()
+returns trigger
+language plpgsql
+as $$
+begin
+  if tg_op = 'INSERT' then
+
+    new.version := 1;
+
+  elsif tg_op = 'UPDATE' then
+
+    new.version := old.version + 1;
+
+    if auth.uid() is not null then
+      new.last_modified_by := auth.uid();
+    end if;
+
+  end if;
+
+  return new;
+end;
+$$;
+
+
+drop trigger if exists carts_sync_metadata_trigger
+on public.carts;
+
+
+create trigger carts_sync_metadata_trigger
+before insert or update
+on public.carts
+for each row
+execute function public.fn_sync_cart_metadata();
+
+
+-- =============================================================================
+-- SECTION 17: CART MEMBER UPDATED_AT
+-- =============================================================================
+
+create or replace function public.fn_cart_members_updated_at()
+returns trigger
+language plpgsql
+as $$
+begin
+  new.updated_at = now();
+  return new;
+end;
+$$;
+
+
+drop trigger if exists cart_members_updated_at_trigger
+on public.cart_members;
+
+
+create trigger cart_members_updated_at_trigger
+before update
+on public.cart_members
+for each row
+execute function public.fn_cart_members_updated_at();
+
+
+-- =============================================================================
+-- SECTION 18: PROTECT CART OWNER
+-- =============================================================================
+
+create or replace function public.fn_protect_cart_owner()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_owner_count integer;
+begin
+  if tg_op = 'DELETE' then
+
+    if old.role = 'owner' and old.status = 'active' then
+
+      select count(*)
+      into v_owner_count
+      from public.cart_members
+      where cart_id = old.cart_id
+        and role = 'owner'
+        and status = 'active';
+
+      if v_owner_count <= 1 then
+        raise exception 'The only active cart owner cannot be removed';
+      end if;
+
+    end if;
+
+    return old;
+  end if;
+
+  if (
+    old.role = 'owner'
+    and old.status = 'active'
+    and (
+      new.role <> 'owner'
+      or new.status <> 'active'
     )
-    RETURNING id INTO v_new_item_id;
+  ) then
 
-    IF v_existing_item.id IS NOT NULL AND p_merge_mode = 'keep_both' THEN
-        UPDATE public.cart_item_conflicts
-        SET resolution_status = 'keep_both',
-            resolved_at = now()
-        WHERE cart_id = p_cart_id AND product_id = p_product_id AND resolution_status = 'pending';
-    END IF;
+    select count(*)
+    into v_owner_count
+    from public.cart_members
+    where cart_id = old.cart_id
+      and role = 'owner'
+      and status = 'active';
 
-    RETURN jsonb_build_object(
-        'conflict', false,
-        'action', CASE WHEN v_existing_item.id IS NOT NULL THEN 'added_distinct' ELSE 'inserted' END,
-        'cart_item_id', v_new_item_id,
-        'quantity', p_quantity
-    );
-END;
-$$ LANGUAGE plpgsql SECURITY DEFINER;
+    if v_owner_count <= 1 then
+      raise exception 'The only active cart owner cannot lose ownership';
+    end if;
 
--- ------------------------------------------------------------
--- 6. PRESENCE & ACTIVE MEMBERS TRACKING
--- ------------------------------------------------------------
-CREATE OR REPLACE FUNCTION public.update_member_presence(p_cart_id UUID)
-RETURNS VOID AS $$
-DECLARE
-    v_user_id UUID;
-BEGIN
-    v_user_id := auth.uid();
-    IF v_user_id IS NOT NULL THEN
-        UPDATE public.cart_members
-        SET last_active_at = now()
-        WHERE cart_id = p_cart_id AND user_id = v_user_id;
-    END IF;
-END;
-$$ LANGUAGE plpgsql SECURITY DEFINER;
+  end if;
 
--- ------------------------------------------------------------
--- 7. LOCK & UNLOCK FOR CHECKOUT FLOW
--- ------------------------------------------------------------
--- Prevents race conditions during checkout (e.g. adding items while another member pays)
-CREATE OR REPLACE FUNCTION public.lock_cart_for_checkout(p_cart_id UUID)
-RETURNS JSONB AS $$
-DECLARE
-    v_user_id UUID;
-    v_cart RECORD;
-BEGIN
-    v_user_id := auth.uid();
-    IF v_user_id IS NULL THEN
-        RAISE EXCEPTION 'Authentication required';
-    END IF;
+  return new;
+end;
+$$;
 
-    IF NOT public.is_cart_member(p_cart_id, v_user_id) THEN
-        RAISE EXCEPTION 'Permission denied: not a member of this cart';
-    END IF;
 
-    SELECT is_locked, locked_by, locked_at INTO v_cart FROM public.carts WHERE id = p_cart_id FOR UPDATE;
+drop trigger if exists protect_cart_owner_trigger
+on public.cart_members;
 
-    IF v_cart.is_locked AND v_cart.locked_by <> v_user_id THEN
-        -- Allow lock takeover if lock expired after 10 minutes
-        IF v_cart.locked_at < now() - INTERVAL '10 minutes' THEN
-            NULL;
-        ELSE
-            RAISE EXCEPTION 'Cart is already locked by another member';
-        END IF;
-    END IF;
 
-    UPDATE public.carts
-    SET is_locked = true,
-        locked_by = v_user_id,
-        locked_at = now()
-    WHERE id = p_cart_id;
+create trigger protect_cart_owner_trigger
+before update or delete
+on public.cart_members
+for each row
+execute function public.fn_protect_cart_owner();
 
-    RETURN jsonb_build_object(
-        'success', true,
-        'is_locked', true,
-        'locked_by', v_user_id
-    );
-END;
-$$ LANGUAGE plpgsql SECURITY DEFINER;
 
-CREATE OR REPLACE FUNCTION public.unlock_cart(p_cart_id UUID)
-RETURNS JSONB AS $$
-DECLARE
-    v_user_id UUID;
-BEGIN
-    v_user_id := auth.uid();
-    IF v_user_id IS NULL THEN
-        RAISE EXCEPTION 'Authentication required';
-    END IF;
+-- =============================================================================
+-- SECTION 19: INDEXES
+-- =============================================================================
 
-    IF NOT public.is_cart_owner_or_admin(p_cart_id, v_user_id) THEN
-        IF NOT EXISTS (SELECT 1 FROM public.carts WHERE id = p_cart_id AND locked_by = v_user_id) THEN
-            RAISE EXCEPTION 'Only the cart owner, admin, or current locker can unlock this cart';
-        END IF;
-    END IF;
+create index if not exists cart_members_cart_id_idx
+on public.cart_members(cart_id);
 
-    UPDATE public.carts
-    SET is_locked = false,
-        locked_by = NULL,
-        locked_at = NULL
-    WHERE id = p_cart_id;
 
-    RETURN jsonb_build_object('success', true, 'is_locked', false);
-END;
-$$ LANGUAGE plpgsql SECURITY DEFINER;
+create index if not exists cart_members_user_id_idx
+on public.cart_members(user_id);
+
+
+create index if not exists cart_members_cart_status_idx
+on public.cart_members(cart_id, status);
+
+
+create index if not exists cart_members_user_status_idx
+on public.cart_members(user_id, status);
+
+
+create index if not exists cart_members_cart_role_idx
+on public.cart_members(cart_id, role);
+
+
+create index if not exists cart_share_links_cart_id_idx
+on public.cart_share_links(cart_id);
+
+
+create index if not exists cart_share_links_active_idx
+on public.cart_share_links(cart_id, revoked_at, expires_at);
+
+
+create index if not exists cart_share_links_token_hash_idx
+on public.cart_share_links(token_hash);
+
+
+create index if not exists cart_items_cart_version_idx
+on public.cart_items(cart_id, version);
+
+
+create index if not exists cart_items_updated_by_idx
+on public.cart_items(updated_by);
+
+
+create index if not exists cart_items_mutation_id_idx
+on public.cart_items(client_mutation_id);
+
+
+create index if not exists cart_item_conflicts_cart_id_idx
+on public.cart_item_conflicts(cart_id);
+
+
+create index if not exists cart_item_conflicts_item_id_idx
+on public.cart_item_conflicts(cart_item_id);
+
+
+create index if not exists cart_item_conflicts_product_id_idx
+on public.cart_item_conflicts(product_id);
+
+
+create index if not exists cart_item_conflicts_pending_idx
+on public.cart_item_conflicts(cart_id, resolution);
+
+
+-- =============================================================================
+-- SECTION 20: ENABLE ROW LEVEL SECURITY
+-- =============================================================================
+
+alter table public.cart_members
+enable row level security;
+
+
+alter table public.cart_share_links
+enable row level security;
+
+
+alter table public.cart_item_conflicts
+enable row level security;
+
+
+-- =============================================================================
+-- SECTION 21: CART MEMBERS RLS
+-- =============================================================================
+
+drop policy if exists cart_members_select_policy
+on public.cart_members;
+
+
+create policy cart_members_select_policy
+on public.cart_members
+for select
+to authenticated
+using (
+  public.is_cart_member(cart_id, auth.uid())
+);
+
+
+drop policy if exists cart_members_insert_owner_policy
+on public.cart_members;
+
+
+create policy cart_members_insert_owner_policy
+on public.cart_members
+for insert
+to authenticated
+with check (
+  public.is_cart_owner(cart_id, auth.uid())
+);
+
+
+drop policy if exists cart_members_update_owner_policy
+on public.cart_members;
+
+
+create policy cart_members_update_owner_policy
+on public.cart_members
+for update
+to authenticated
+using (
+  public.is_cart_owner(cart_id, auth.uid())
+)
+with check (
+  public.is_cart_owner(cart_id, auth.uid())
+);
+
+
+drop policy if exists cart_members_delete_owner_policy
+on public.cart_members;
+
+
+create policy cart_members_delete_owner_policy
+on public.cart_members
+for delete
+to authenticated
+using (
+  public.is_cart_owner(cart_id, auth.uid())
+);
+
+
+-- =============================================================================
+-- SECTION 22: SHARE LINK RLS
+-- =============================================================================
+
+drop policy if exists cart_share_links_select_owner_policy
+on public.cart_share_links;
+
+
+create policy cart_share_links_select_owner_policy
+on public.cart_share_links
+for select
+to authenticated
+using (
+  public.is_cart_owner(cart_id, auth.uid())
+);
+
+
+drop policy if exists cart_share_links_insert_owner_policy
+on public.cart_share_links;
+
+
+create policy cart_share_links_insert_owner_policy
+on public.cart_share_links
+for insert
+to authenticated
+with check (
+  public.is_cart_owner(cart_id, auth.uid())
+  and created_by = auth.uid()
+);
+
+
+drop policy if exists cart_share_links_update_owner_policy
+on public.cart_share_links;
+
+
+create policy cart_share_links_update_owner_policy
+on public.cart_share_links
+for update
+to authenticated
+using (
+  public.is_cart_owner(cart_id, auth.uid())
+)
+with check (
+  public.is_cart_owner(cart_id, auth.uid())
+);
+
+
+drop policy if exists cart_share_links_delete_owner_policy
+on public.cart_share_links;
+
+
+create policy cart_share_links_delete_owner_policy
+on public.cart_share_links
+for delete
+to authenticated
+using (
+  public.is_cart_owner(cart_id, auth.uid())
+);
+
+
+-- =============================================================================
+-- SECTION 23: CONFLICT RLS
+-- =============================================================================
+
+drop policy if exists cart_item_conflicts_select_policy
+on public.cart_item_conflicts;
+
+
+create policy cart_item_conflicts_select_policy
+on public.cart_item_conflicts
+for select
+to authenticated
+using (
+  public.is_cart_member(cart_id, auth.uid())
+);
+
+
+drop policy if exists cart_item_conflicts_insert_policy
+on public.cart_item_conflicts;
+
+
+create policy cart_item_conflicts_insert_policy
+on public.cart_item_conflicts
+for insert
+to authenticated
+with check (
+  public.can_edit_cart(cart_id, auth.uid())
+  and (
+    incoming_updated_by = auth.uid()
+    or incoming_updated_by is null
+  )
+);
+
+
+drop policy if exists cart_item_conflicts_update_policy
+on public.cart_item_conflicts;
+
+
+create policy cart_item_conflicts_update_policy
+on public.cart_item_conflicts
+for update
+to authenticated
+using (
+  public.can_edit_cart(cart_id, auth.uid())
+)
+with check (
+  public.can_edit_cart(cart_id, auth.uid())
+);
+
+
+-- =============================================================================
+-- SECTION 24: UPDATE EXISTING CART RLS FOR SHARED ACCESS
+-- =============================================================================
+
+drop policy if exists carts_select_own
+on public.carts;
+
+
+create policy carts_select_shared
+on public.carts
+for select
+to authenticated
+using (
+  public.is_cart_member(id, auth.uid())
+);
+
+
+drop policy if exists carts_update_own
+on public.carts;
+
+
+create policy carts_update_shared
+on public.carts
+for update
+to authenticated
+using (
+  public.can_edit_cart(id, auth.uid())
+)
+with check (
+  public.can_edit_cart(id, auth.uid())
+);
+
+
+drop policy if exists carts_delete_own
+on public.carts;
+
+
+create policy carts_delete_owner
+on public.carts
+for delete
+to authenticated
+using (
+  public.is_cart_owner(id, auth.uid())
+);
+
+
+-- =============================================================================
+-- SECTION 25: UPDATE EXISTING CART ITEM RLS FOR SHARED ACCESS
+-- =============================================================================
+
+drop policy if exists cart_items_select_own
+on public.cart_items;
+
+
+create policy cart_items_select_shared
+on public.cart_items
+for select
+to authenticated
+using (
+  public.is_cart_member(cart_id, auth.uid())
+);
+
+
+drop policy if exists cart_items_insert_own
+on public.cart_items;
+
+
+create policy cart_items_insert_shared
+on public.cart_items
+for insert
+to authenticated
+with check (
+  public.can_edit_cart(cart_id, auth.uid())
+);
+
+
+drop policy if exists cart_items_update_own
+on public.cart_items;
+
+
+create policy cart_items_update_shared
+on public.cart_items
+for update
+to authenticated
+using (
+  public.can_edit_cart(cart_id, auth.uid())
+)
+with check (
+  public.can_edit_cart(cart_id, auth.uid())
+);
+
+
+drop policy if exists cart_items_delete_own
+on public.cart_items;
+
+
+create policy cart_items_delete_shared
+on public.cart_items
+for delete
+to authenticated
+using (
+  public.can_edit_cart(cart_id, auth.uid())
+);
+
+
+-- =============================================================================
+-- SECTION 26: SECURE FUNCTION EXECUTION
+-- =============================================================================
+
+revoke all
+on function public.is_cart_member(uuid, uuid)
+from public;
+
+
+grant execute
+on function public.is_cart_member(uuid, uuid)
+to authenticated;
+
+
+revoke all
+on function public.is_cart_owner(uuid, uuid)
+from public;
+
+
+grant execute
+on function public.is_cart_owner(uuid, uuid)
+to authenticated;
+
+
+revoke all
+on function public.can_edit_cart(uuid, uuid)
+from public;
+
+
+grant execute
+on function public.can_edit_cart(uuid, uuid)
+to authenticated;
+
+
+revoke all
+on function public.can_view_cart(uuid, uuid)
+from public;
+
+
+grant execute
+on function public.can_view_cart(uuid, uuid)
+to authenticated;
+
+
+revoke all
+on function public.hash_cart_share_token(text)
+from public;
+
+
+grant execute
+on function public.hash_cart_share_token(text)
+to authenticated;
+
+
+revoke all
+on function public.create_cart_share_link(uuid, timestamptz)
+from public;
+
+
+grant execute
+on function public.create_cart_share_link(uuid, timestamptz)
+to authenticated;
+
+
+revoke all
+on function public.join_cart_with_share_token(text)
+from public;
+
+
+grant execute
+on function public.join_cart_with_share_token(text)
+to authenticated;
+
+
+revoke all
+on function public.revoke_cart_share_link(uuid)
+from public;
+
+
+grant execute
+on function public.revoke_cart_share_link(uuid)
+to authenticated;
+
+
+-- =============================================================================
+-- SECTION 27: SUPABASE REALTIME
+-- =============================================================================
+
+do $$
+begin
+
+  if not exists (
+    select 1
+    from pg_publication_tables
+    where pubname = 'supabase_realtime'
+      and schemaname = 'public'
+      and tablename = 'cart_members'
+  ) then
+
+    alter publication supabase_realtime
+      add table public.cart_members;
+
+  end if;
+
+
+  if not exists (
+    select 1
+    from pg_publication_tables
+    where pubname = 'supabase_realtime'
+      and schemaname = 'public'
+      and tablename = 'cart_items'
+  ) then
+
+    alter publication supabase_realtime
+      add table public.cart_items;
+
+  end if;
+
+
+  if not exists (
+    select 1
+    from pg_publication_tables
+    where pubname = 'supabase_realtime'
+      and schemaname = 'public'
+      and tablename = 'carts'
+  ) then
+
+    alter publication supabase_realtime
+      add table public.carts;
+
+  end if;
+
+
+  if not exists (
+    select 1
+    from pg_publication_tables
+    where pubname = 'supabase_realtime'
+      and schemaname = 'public'
+      and tablename = 'cart_item_conflicts'
+  ) then
+
+    alter publication supabase_realtime
+      add table public.cart_item_conflicts;
+
+  end if;
+
+end
+$$;
+
+
+-- =============================================================================
+-- SECTION 28: REALTIME REPLICA IDENTITY
+-- =============================================================================
+
+alter table public.cart_members
+replica identity full;
+
+
+alter table public.cart_items
+replica identity full;
+
+
+alter table public.carts
+replica identity full;
+
+
+alter table public.cart_item_conflicts
+replica identity full;
+
+
+-- =============================================================================
+-- SECTION 29: COMMENTS
+-- =============================================================================
+
+comment on table public.cart_members is
+'Users who participate in a shared InstaDaily cart.';
+
+comment on table public.cart_share_links is
+'Secure, expiring share tokens used to join shared carts. Only token hashes are stored.';
+
+comment on table public.cart_item_conflicts is
+'Concurrent cart-item edit records used by the client to resolve Keep Both or Merge conflicts.';
+
+comment on column public.cart_items.version is
+'Monotonically increasing optimistic-concurrency version for collaborative cart updates.';
+
+comment on column public.cart_items.client_mutation_id is
+'Client-generated UUID used to identify an individual cart mutation and support idempotency/concurrency handling.';
+
+comment on column public.carts.version is
+'Monotonically increasing version for collaborative cart state.';
+
+
+-- =============================================================================
+-- END OF 02_sync_cart_schema.sql
+-- =============================================================================
